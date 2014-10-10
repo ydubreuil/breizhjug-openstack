@@ -1,0 +1,153 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+nodes = {
+    'devstack' => [1, 100],
+}
+
+$commonscript = <<COMMONSCRIPT
+
+#### Prep Environment
+adduser --disabled-password --gecos "" stack
+echo "stack ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+git clone -b stable/icehouse https://github.com/openstack-dev/devstack.git /home/stack/devstack/
+git clone https://github.com/openstack/heat-templates.git /home/stack/heat-templates/
+
+ADMIN_PASSWORD="breizhjug"
+
+echo "
+[[local|localrc]]
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+DATABASE_PASSWORD=$ADMIN_PASSWORD
+RABBIT_PASSWORD=$ADMIN_PASSWORD
+SERVICE_PASSWORD=$ADMIN_PASSWORD
+SERVICE_TOKEN=4d2289b4-6680-4a7e-aa5e-eed2de85ccc7
+
+#FIXED_RANGE=172.31.1.0/24
+#FLOATING_RANGE=192.168.20.0/25
+#HOST_IP=172.16.80.110
+
+disable_service n-net
+
+# Neutron - Networking Service
+# If Neutron is not declared the old good nova-network will be used
+ENABLED_SERVICES+=,q-svc,q-agt,q-dhcp,q-l3,q-meta,neutron
+
+## Neutron - Load Balancing
+ENABLED_SERVICES+=,q-lbaas
+
+## Neutron - VPN as a Service
+ENABLED_SERVICES+=,q-vpn
+
+## Neutron - Firewall as a Service
+ENABLED_SERVICES+=,q-fwaas
+
+# Neutron Stuff
+OVS_VLAN_RANGES=RegionOne:1:4000
+OVS_ENABLE_TUNNELING=False
+
+# Heat - Orchestration Service
+ENABLED_SERVICES+=,heat,h-api,h-api-cfn,h-api-cw,h-eng
+
+# Ceilometer - Metering Service (metering + alarming)
+ENABLED_SERVICES+=,ceilometer-acompute,ceilometer-acentral,ceilometer-collector,ceilometer-api
+ENABLED_SERVICES+=,ceilometer-alarm-notify,ceilometer-alarm-eval
+
+## It would also be useful to automatically download and register VM images that Heat can launch.
+# 32bit image (~660MB)
+IMAGE_URLS+=",http://fedorapeople.org/groups/heat/prebuilt-jeos-images/F19-i386-cfntools.qcow2"
+# 64bit image (~640MB)
+IMAGE_URLS+=",http://fedorapeople.org/groups/heat/prebuilt-jeos-images/F19-x86_64-cfntools.qcow2"
+IMAGE_URLS+=",http://mirror.chpc.utah.edu/pub/fedora/linux/releases/20/Images/x86_64/Fedora-x86_64-20-20131211.1-sda.qcow2"
+
+# Output
+LOGFILE=/opt/stack/logs/stack.sh.log
+VERBOSE=True
+LOG_COLOR=False
+SCREEN_LOGDIR=/opt/stack/logs
+" | tee -a /home/stack/devstack/local.conf
+
+awk '/install_pip.sh/ { print; print "sudo pip install --upgrade setuptools"; next }1' /home/stack/devstack/stack.sh > /home/stack/devstack/stack_patched.sh
+chmod +x /home/stack/devstack/stack_patched.sh
+
+chown -vR stack:stack /home/stack
+
+adduser --disabled-password --gecos "" demo
+
+COMMONSCRIPT
+
+# Vagrantfile API/syntax version. Don't touch unless you know what you're doing!
+VAGRANTFILE_API_VERSION = "2"
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  hostname = "devstack"
+  
+  # Virtual Box
+  config.vm.box = "precise64"
+  config.vm.box_url = "https://vagrantcloud.com/hashicorp/precise64/version/2/provider/virtualbox.box"
+
+  config.vm.provider "virtualbox" do |vbox|
+    vbox.gui = false
+    vbox.memory = 4096
+    vbox.cpus = 2
+  end
+
+  # proxy configuration is not our friend !
+  if Vagrant.has_plugin?("vagrant-proxyconf")
+    config.proxy.http     = ""
+    config.proxy.https    = ""
+    config.proxy.no_proxy = ""
+  end
+
+  # Rackspace Cloud
+  config.vm.provider "rackspace" do |rs, override|
+      override.vm.box = "dummy"
+      override.vm.box_url = "https://github.com/mitchellh/vagrant-rackspace/raw/master/dummy.box"
+      override.ssh.private_key_path = "~/.ssh/id_rsa"
+      rs.username        = "username"
+      rs.api_key         = "api_key"
+      rs.flavor          = /4GB/              # I've fonud this works better with LOTS of ram, like the 30gb instances, but ymmv
+      rs.image           = /Ubuntu 12.04/i    # Change as needed
+      rs.public_key_path = "public_key_path"  # Path to your public key, can be omitted if using the generic vagrant ones (don't do that)
+      rs.rackspace_region = :rackspace_region # things like :dfw and :ord
+  end
+
+
+  # VMware Fusion
+  config.vm.provider "vmware_fusion" do |vmware, override|
+    override.vm.box = "precise64_fusion"
+    override.vm.box_url = "https://vagrantcloud.com/hashicorp/precise64/version/2/provider/vmware_fusion.box"
+    override.vm.synced_folder ".", "/vagrant", type: "nfs"
+
+    # Fusion Performance Hacks
+    vmware.vmx["logging"] = "FALSE"
+    vmware.vmx["MemTrimRate"] = "0"
+    vmware.vmx["MemAllowAutoScaleDown"] = "FALSE"
+    vmware.vmx["mainMem.backing"] = "swap"
+    vmware.vmx["sched.mem.pshare.enable"] = "FALSE"
+    vmware.vmx["snapshot.disabled"] = "TRUE"
+    vmware.vmx["isolation.tools.unity.disable"] = "TRUE"
+    vmware.vmx["unity.allowCompostingInGuest"] = "FALSE"
+    vmware.vmx["unity.enableLaunchMenu"] = "FALSE"
+    vmware.vmx["unity.showBadges"] = "FALSE"
+    vmware.vmx["unity.showBorders"] = "FALSE"
+    vmware.vmx["unity.wasCapable"] = "FALSE"
+    vmware.vmx["memsize"] = "6144"
+    vmware.vmx["numvcpus"] = "2"
+  end
+
+  nodes.each do |prefix, (count, ip_start)|
+    count.times do |i|
+
+        hostname = "%s-%02d" % [prefix, (i+1)]
+
+        config.vm.define hostname do |box|
+          box.vm.hostname = "#{hostname}"
+          box.vm.network "forwarded_port", guest: 80, host: (8080 + i)
+          box.vm.provision :shell, :inline => "sudo apt-get update && sudo apt-get install -y vim wget git curl"
+          box.vm.provision :shell, :inline => "sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\" dist-upgrade"
+          box.vm.provision :shell, :inline => $commonscript
+        end
+      end
+    end
+end
